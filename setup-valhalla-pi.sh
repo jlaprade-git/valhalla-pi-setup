@@ -49,6 +49,8 @@ WEB_PORT=""
 CENTER=""
 ASSUME_YES=0
 NO_START=0
+PREBUILT=""
+PREBUILT_PMTILES=""
 ACTION="install"
 SERVICE_USER="valhalla"
 UNITS=(valhalla-routing valhalla-tiles valhalla-photon)
@@ -70,6 +72,10 @@ Usage: sudo bash setup-valhalla-pi.sh --region <geofabrik-path> [options]
   --center LAT,LON  Initial map position (default: middle of the region)
   --yes             Do not ask for confirmation
   --no-start        Install everything but do not enable or start services
+  --prebuilt SRC    Skip the builds and use routing and map tiles made on a
+                    bigger machine. SRC is a folder holding valhalla_tiles.tar
+                    and one .pmtiles file, or a URL serving valhalla_tiles.tar
+                    and basemap.pmtiles. Use with --search (e.g. north-america).
   --uninstall       Stop and remove the services and the nginx site
   -h, --help        Show this help
 USAGE
@@ -107,6 +113,7 @@ parse_args() {
       --center)    CENTER="${2:?--center needs a value}"; shift 2 ;;
       --yes|-y)    ASSUME_YES=1; shift ;;
       --no-start)  NO_START=1; shift ;;
+      --prebuilt)  PREBUILT="${2:?--prebuilt needs a folder or URL}"; shift 2 ;;
       --uninstall) ACTION="uninstall"; shift ;;
       -h|--help)   usage; exit 0 ;;
       *) usage; die "Unknown option: $1" ;;
@@ -189,16 +196,49 @@ plan() {
       die "$DATA_DIR already holds region '$SAVED_REGION'. Run with --uninstall first, or use a different --data-dir."
     fi
     REGION="$SAVED_REGION"
-    [ "$SEARCH" = "auto" ] && SEARCH="$SAVED_SEARCH"
-    [ -z "$WEB_PORT" ] && WEB_PORT="$SAVED_WEB_PORT"
+    if [ "$SEARCH" = "auto" ]; then SEARCH="$SAVED_SEARCH"; fi
+    if [ -z "$WEB_PORT" ]; then WEB_PORT="$SAVED_WEB_PORT"; fi
+    if [ -z "$PREBUILT" ]; then PREBUILT="${SAVED_PREBUILT:-}"; fi
   fi
-  [ -n "$REGION" ] || { usage; die "--region is required."; }
 
-  PBF_URL="$GEOFABRIK/$REGION-latest.osm.pbf"
-  PBF_BYTES=$(remote_size "$PBF_URL")
-  [ -n "$PBF_BYTES" ] || die "Region '$REGION' was not found at $PBF_URL. Check the path on https://download.geofabrik.de"
+  PBF_BYTES=0
+  PREBUILT_MB=0
+  if [ -n "$PREBUILT" ]; then
+    # Prebuilt mode: routing and map tiles were built on a bigger machine.
+    PREBUILT="${PREBUILT%/}"
+    if [ "$SEARCH" = "auto" ] && [ -z "$REGION" ]; then
+      die "With --prebuilt, say which search index to use: --search north-america (or a country path, or none)."
+    fi
+    REGION="${REGION:-prebuilt}"
+    case "$( [ -f "$DATA_DIR/valhalla/.build-complete" ] && echo done || echo "$PREBUILT" )" in
+      done) ;; # already installed on an earlier run: the source is no longer needed
+      http://*|https://*)
+        local routing_bytes tiles_bytes
+        routing_bytes=$(remote_size "$PREBUILT/valhalla_tiles.tar")
+        tiles_bytes=$(remote_size "$PREBUILT/basemap.pmtiles")
+        [ -n "$routing_bytes" ] || die "Not found: $PREBUILT/valhalla_tiles.tar"
+        [ -n "$tiles_bytes" ] || die "Not found: $PREBUILT/basemap.pmtiles"
+        PREBUILT_MB=$(((routing_bytes + tiles_bytes) / 1000000))
+        ;;
+      *)
+        [ -f "$PREBUILT/valhalla_tiles.tar" ] || die "Not found: $PREBUILT/valhalla_tiles.tar"
+        PREBUILT_PMTILES=$(find "$PREBUILT" -maxdepth 1 -name '*.pmtiles' | sort)
+        [ -n "$PREBUILT_PMTILES" ] || die "No .pmtiles file found in $PREBUILT"
+        [ "$(wc -l <<<"$PREBUILT_PMTILES")" = 1 ] || die "More than one .pmtiles file in $PREBUILT: keep only the one to use."
+        # no extra space is needed when the files are on the same disk (they are hard-linked)
+        if [ "$(stat -c %d "$PREBUILT")" != "$(mkdir -p "$DATA_DIR" && stat -c %d "$DATA_DIR")" ]; then
+          PREBUILT_MB=$(du -cm "$PREBUILT/valhalla_tiles.tar" "$PREBUILT_PMTILES" | awk 'END {print $1}')
+        fi
+        ;;
+    esac
+  else
+    [ -n "$REGION" ] || { usage; die "--region is required (or --prebuilt to use data built elsewhere)."; }
+    PBF_URL="$GEOFABRIK/$REGION-latest.osm.pbf"
+    PBF_BYTES=$(remote_size "$PBF_URL")
+    [ -n "$PBF_BYTES" ] || die "Region '$REGION' was not found at $PBF_URL. Check the path on https://download.geofabrik.de"
+  fi
 
-  [ "$SEARCH" = "auto" ] && SEARCH=$(derive_search)
+  if [ "$SEARCH" = "auto" ]; then SEARCH=$(derive_search); fi
   PHOTON_BYTES=0
   if [ "$SEARCH" != "none" ]; then
     PHOTON_BYTES=$(remote_size "$(photon_url "$SEARCH")")
@@ -211,12 +251,13 @@ plan() {
 
   local pbf_mb=$((PBF_BYTES / 1000000)) photon_mb=$((PHOTON_BYTES / 1000000))
   # rough peak: OSM file + routing build + tile build temp files; search archive + extracted index
-  NEED_MB=$((pbf_mb * 12 + photon_mb * 27 / 10 + 4000))
+  NEED_MB=$((pbf_mb * 12 + PREBUILT_MB + photon_mb * 27 / 10 + 4000))
   mkdir -p "$DATA_DIR"
   FREE_MB=$(df -Pm "$DATA_DIR" | awk 'NR==2 {print $4}')
 
   log "Plan"
-  info "Region:          $REGION  (OSM extract: ${pbf_mb} MB)"
+  if [ -n "$PREBUILT" ]; then info "Prebuilt data:   $PREBUILT  (nothing is built on this machine)"
+  else info "Region:          $REGION  (OSM extract: ${pbf_mb} MB)"; fi
   if [ "$SEARCH" = "none" ]; then info "Search:          disabled"
   else info "Search index:    $SEARCH  (download: ${photon_mb} MB)"; fi
   info "Install dir:     $DATA_DIR"
@@ -312,6 +353,7 @@ choose_ports() {
   fi
   cat > "$STATE_FILE" <<EOF
 SAVED_REGION="$REGION"
+SAVED_PREBUILT="$PREBUILT"
 SAVED_SEARCH="$SEARCH"
 SAVED_WEB_PORT="$WEB_PORT"
 SAVED_VALHALLA_PORT="$VALHALLA_PORT"
@@ -324,6 +366,29 @@ EOF
 # ---- step: downloads -----------------------------------------------------------
 fetch() { # fetch URL DEST  (resumable)
   curl -fL --retry 5 --retry-delay 5 -C - -o "$2" "$1"
+}
+
+place_file() { # hard-link when on the same disk (instant, no extra space), otherwise copy
+  ln -f "$1" "$2" 2>/dev/null || cp "$1" "$2"
+}
+
+install_prebuilt() {
+  local routing="$DATA_DIR/valhalla/valhalla_tiles.tar" tiles="$DATA_DIR/tiles/basemap.pmtiles"
+  if [ -f "$DATA_DIR/valhalla/.build-complete" ] && [ -s "$routing" ] && [ -s "$tiles" ]; then
+    info "Prebuilt routing and map tiles already in place."; return
+  fi
+  log "Installing prebuilt routing and map tiles from $PREBUILT"
+  case "$PREBUILT" in
+    http://*|https://*)
+      if [ ! -s "$routing" ]; then fetch "$PREBUILT/valhalla_tiles.tar" "$routing.part"; mv "$routing.part" "$routing"; fi
+      if [ ! -s "$tiles" ]; then fetch "$PREBUILT/basemap.pmtiles" "$tiles.part"; mv "$tiles.part" "$tiles"; fi
+      ;;
+    *)
+      place_file "$PREBUILT/valhalla_tiles.tar" "$routing"
+      place_file "$PREBUILT_PMTILES" "$tiles"
+      ;;
+  esac
+  touch "$DATA_DIR/valhalla/.build-complete"
 }
 
 download_osm() {
@@ -903,7 +968,7 @@ main() {
   choose_ports
   id "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
 
-  download_osm
+  if [ -n "$PREBUILT" ]; then install_prebuilt; else download_osm; fi
   install_tools
   build_routing
   build_map_tiles

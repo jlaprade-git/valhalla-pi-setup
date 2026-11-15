@@ -31,7 +31,23 @@ When it finishes it prints the address to open, for example `http://<pi-address>
 | `--center LAT,LON` | Initial map position (default: middle of the region) |
 | `--yes` | Do not ask for confirmation |
 | `--no-start` | Install everything but do not enable or start services |
+| `--prebuilt SRC` | Skip the builds and use routing and map tiles made elsewhere (folder or URL, see below) |
 | `--uninstall` | Stop and remove the services and the nginx site |
+
+## Big regions: build elsewhere, run on the Pi
+
+A Pi cannot realistically build a continent, but it can serve one. Build the data on a bigger machine, then give the Pi two files:
+
+- `valhalla_tiles.tar` (Valhalla routing tiles)
+- one `.pmtiles` file (planetiler vector map tiles, OpenMapTiles schema)
+
+Put both in a folder (for example on the Pi's SSD) and run:
+
+```bash
+sudo bash setup-valhalla-pi.sh --prebuilt /path/to/folder --search north-america
+```
+
+Nothing is built on the Pi in this mode. The search index is still downloaded directly (`--search` takes a continent or country path, or `none`). If the folder is on the same disk as the install directory the files are hard-linked, so no extra space is used. `--prebuilt` also accepts a URL that serves `valhalla_tiles.tar` and `basemap.pmtiles`.
 
 ## Requirements
 
@@ -71,7 +87,7 @@ sudo bash setup-valhalla-pi.sh --uninstall
 
 ## Test status
 
-Tested end to end on Debian 13 (amd64) with a small region: install, port-collision handling, routing, map rendering and search. Not yet tested on real Raspberry Pi hardware, and the fallback path for Debian 12 (private Python 3.12) has not been exercised. Time-dependent routing is limited because no time zone database is built.
+Tested end to end on Debian 13 (amd64) with a small region: install, port-collision handling, routing, map rendering and search, plus `--prebuilt` from a folder (the URL form is untested). Not yet tested on real Raspberry Pi hardware, and the fallback path for Debian 12 (private Python 3.12) has not been exercised. Time-dependent routing is limited because no time zone database is built.
 
 ## Credits
 
